@@ -5,24 +5,26 @@ Query types:
   - search_observations: Search observations by keyword (e.g. "Trae", "VSCode")
   - timeline: Recent observations as a readable timeline
   - session_stats: Current session statistics
-  - profile_get: Get a specific user profile key
-  - profile_all: Get all user profile entries
+  - profile_get: Get a specific user profile section (key="about_me"|"projects"|"preferences")
+  - profile_all: Get full user profile (markdown format)
   - chain_detail: Get full detail of a specific thought chain
 """
 
 import json
 from memory.store import MemoryStore
+from memory.profile import UserProfile
 
 
 class MemoryQueryTool:
-    """Tool wrapper for querying the agent's own SQLite memory store.
+    """Tool wrapper for querying the agent's own SQLite memory store and markdown profile.
 
     This is the PREFERRED way to query agent memory. Do NOT use bash/sqlite3
     to query the database directly - always use this tool.
     """
 
-    def __init__(self, store: MemoryStore):
+    def __init__(self, store: MemoryStore, profile: UserProfile | None = None):
         self._store = store
+        self._profile = profile
 
     def handle(self, query_type: str, key: str = "", keyword: str = "", limit: int = 10) -> str:
         """Query agent memory.
@@ -33,8 +35,8 @@ class MemoryQueryTool:
                 - 'search_observations': Search by keyword in window/app/message
                 - 'timeline': Readable timeline of recent observations
                 - 'session_stats': Current session statistics
-                - 'profile_get': Get specific profile key (requires 'key')
-                - 'profile_all': Get all profile entries
+                - 'profile_get': Get a specific profile section. key='about_me'|'projects'|'preferences'
+                - 'profile_all': Get full user profile (markdown with auto-tracked data and LLM-written sections)
                 - 'chain_detail': Get full chain by chain_id (requires 'key')
             key: Profile key (for profile_get) or chain_id (for chain_detail).
             keyword: Search keyword (for search_observations).
@@ -157,15 +159,26 @@ class MemoryQueryTool:
         )
 
     def _profile_get(self, key: str) -> str:
-        value = self._store.get_profile(key)
-        return f"{key}={value}" if value else f"No profile entry for '{key}'."
+        if self._profile is None:
+            return "Profile system not available."
+        sections = {
+            "about_me": self._profile.get_about_me,
+            "projects": self._profile.get_projects,
+            "preferences": self._profile.get_preferences,
+        }
+        getter = sections.get(key)
+        if not getter:
+            return (
+                f"Unknown section '{key}'. Available: about_me, projects, preferences. "
+                "Use profile_all to see the full profile."
+            )
+        value = getter()
+        return f"[{key}]\n{value}" if value else f"[{key}] (empty)"
 
     def _profile_all(self) -> str:
-        profile = self._store.get_all_profile()
-        if not profile:
-            return "No profile entries yet."
-        lines = [f"  {k}={v}" for k, v in profile.items()]
-        return "User profile:\n" + "\n".join(lines)
+        if self._profile is None:
+            return "Profile system not available."
+        return self._profile.summarize()
 
     def _chain_detail(self, chain_id: str) -> str:
         detail = self._store.get_chain_detail(chain_id)
@@ -189,7 +202,7 @@ class MemoryQueryTool:
             "  - search_observations: Search by keyword (pass 'keyword' param)\n"
             "  - timeline: Readable observation timeline\n"
             "  - session_stats: Current session statistics\n"
-            "  - profile_get: Get specific profile key (pass 'key' param)\n"
-            "  - profile_all: Get all profile entries\n"
+            "  - profile_get: Get profile section. key='about_me'|'projects'|'preferences'\n"
+            "  - profile_all: Get full profile (markdown)\n"
             "  - chain_detail: Get full chain detail (pass 'key' param)"
         )

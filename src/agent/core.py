@@ -34,7 +34,18 @@ class AgentCore:
         return self._history
 
     def run_turn(self, is_proactive: bool = False):
-        """Run one agent turn - may include multiple tool-call loops."""
+        """Run one agent turn - may include multiple tool-call loops.
+
+        Tracks whether send_message was actually dispatched during tool calls
+        to accurately record the action in the thought chain (fixes the bug
+        where the final text-only response has no tool_use blocks to inspect).
+        Also captures the LLM's reasoning text from the first response
+        (before tool_use blocks) and stores it as inference in the thought chain.
+        """
+        spoke = False
+        spoken_content = ""
+        inference = ""
+
         while True:
             response = self._client.messages.create(
                 model=self._model,
@@ -45,16 +56,31 @@ class AgentCore:
             )
             self._history.append({"role": "assistant", "content": response.content})
 
+            # Capture reasoning text from the first response (before tool_use)
+            if is_proactive and not inference:
+                inference = self._extract_text(response.content)
+
             if response.stop_reason != "tool_use":
                 text = self._extract_text(response.content).strip()
                 if text and not is_proactive:
                     print(text)
-                self._record_action_from_response(response, is_proactive)
+                # Record action based on actual tool use during this turn,
+                # not on the final text-only response (which lacks tool_use blocks)
+                if is_proactive:
+                    self._memory.record_cycle(
+                        observation="(see previous perception)",
+                        action="send_message" if spoke else "silent",
+                        content=spoken_content,
+                        inference=inference,
+                    )
                 break
 
             results = []
             for block in response.content:
                 if block.type == "tool_use":
+                    if block.name == "send_message":
+                        spoke = True
+                        spoken_content = block.input.get("content", "")
                     output = self._tools.dispatch(block.name, **block.input)
                     Terminal.tool_debug(f"{block.name}: {str(output)[:200]}")
                     results.append({
@@ -64,26 +90,6 @@ class AgentCore:
                     })
 
             self._history.append({"role": "user", "content": results})
-
-    def _record_action_from_response(self, response, is_proactive: bool):
-        """Record the agent's action in the thought chain."""
-        if not is_proactive:
-            return  # Only record proactive turns
-
-        # Determine what action was taken
-        action = "silent"
-        content = ""
-        for block in response.content:
-            if hasattr(block, "name") and block.name == "send_message":
-                action = "send_message"
-                content = block.input.get("content", "")
-                break
-
-        self._memory.record_cycle(
-            observation="(see previous perception)",
-            action=action,
-            content=content,
-        )
 
     def clear_history(self):
         """Clear conversation history."""

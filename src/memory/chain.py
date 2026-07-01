@@ -54,7 +54,11 @@ class ThoughtChain:
         self._update_profile(observation, action, content)
 
     def get_context_for_llm(self, limit: int = 5) -> str:
-        """Build a context string from recent thought chains for LLM prompt injection."""
+        """Build a context string from recent thought chains for LLM prompt injection.
+
+        Now includes the inference (reasoning) text for each entry, creating
+        a complete observation → inference → action → outcome chain.
+        """
         chains = self._store.get_recent_chains(self.ensure_session(), limit=limit)
         if not chains:
             return ""
@@ -64,17 +68,31 @@ class ThoughtChain:
             time_str = c.get("timestamp", "unknown")
             action = c.get("action", "silent")
             content = c.get("content", "")
+            inference = c.get("inference", "")
+
+            line = f"  {time_str}: "
             if action == "send_message" and content:
-                lines.append(f"  {time_str}: Spoke → \"{content}\"")
+                line += f"Spoke → \"{content}\""
             elif action == "silent":
-                lines.append(f"  {time_str}: Observed, stayed silent")
+                line += "Observed, stayed silent"
             else:
-                lines.append(f"  {time_str}: {action}")
+                line += f"Action: {action}"
+
+            if inference:
+                # Truncate long inference to keep context concise
+                inf = inference[:120].replace("\n", " ")
+                line += f"\n            ↳ 推理: {inf}"
+
+            lines.append(line)
         return "\n".join(lines)
 
     def get_profile_context(self) -> str:
         """Build a profile summary for LLM prompt injection."""
         return self._profile.summarize()
+
+    def get_silent_streak(self) -> int:
+        """How many consecutive wake cycles have been silent (no send_message)."""
+        return self._store.get_silent_streak(self.ensure_session())
 
     def end_session(self, summary: str = ""):
         """Close the current session."""

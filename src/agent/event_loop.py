@@ -46,7 +46,8 @@ class EventLoop:
         self._notifier = Notifier(event_queue=self._event_queue, callback_port=CALLBACK_PORT)
         self._callback_server = ReplyHTTPServer(CALLBACK_PORT, self._event_queue)
         self._memory_store = MemoryStore(config.db_path)
-        self._profile = UserProfile(self._memory_store)
+        profile_md_path = config.db_path.parent / "user_profile.md"
+        self._profile = UserProfile(profile_md_path)
         self._memory = ThoughtChain(self._memory_store, self._profile)
 
         # Initialize tools
@@ -84,7 +85,7 @@ class EventLoop:
         shell = Shell(self._config.workdir)
         wake_tool = WakeTool(self._scheduler)
         message_tool = MessageTool(self._notifier)
-        memory_query_tool = MemoryQueryTool(self._memory_store)
+        memory_query_tool = MemoryQueryTool(self._memory_store, profile=self._profile)
 
         registry.register(Tool(
             name="bash",
@@ -145,8 +146,8 @@ class EventLoop:
                 "  - search_observations: 按关键词搜索观察记录（如 keyword='Trae' 查找所有包含 Trae 的记录）\n"
                 "  - timeline: 可读的观察时间线\n"
                 "  - session_stats: 当前会话统计\n"
-                "  - profile_get: 查指定画像键（需传 key 参数）\n"
-                "  - profile_all: 查全部用户画像\n"
+                "  - profile_get: 查用户画像section。key='about_me'|'projects'|'preferences'\n"
+                "  - profile_all: 查完整用户画像（markdown格式，含自动追踪数据和LLM写入的语义信息）\n"
                 "  - chain_detail: 查指定思维链条详情（需传 key 参数为 chain_id）"
             ),
             input_schema={
@@ -158,7 +159,7 @@ class EventLoop:
                     },
                     "key": {
                         "type": "string",
-                        "description": "profile_get 时传画像键名；chain_detail 时传 chain_id。",
+                        "description": "profile_get 时传 section 名(about_me/projects/preferences)；chain_detail 时传 chain_id。",
                     },
                     "keyword": {
                         "type": "string",
@@ -232,6 +233,39 @@ class EventLoop:
                 kw["content"], kw.get("quick_replies")
             ),
         ))
+        registry.register(Tool(
+            name="update_profile",
+            description=(
+                "更新你对用户的了解。当你通过对话了解到用户的新信息时，用此工具记录到用户画像中。"
+                "可选的 section：\n"
+                "  - about_me: 用户的角色、技术栈、身份等\n"
+                "  - projects: 用户的当前项目及进展\n"
+                "  - preferences: 用户的偏好（沟通风格、工作习惯等）\n"
+                "注意：不要在无用户确认时擅自填充虚构信息。只记录用户明确告知或你从对话中合理推断的信息。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "section": {
+                        "type": "string",
+                        "enum": ["about_me", "projects", "preferences"],
+                        "description": "要更新的section：about_me, projects, preferences",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "更新内容。应简洁、事实性，直接来自用户对话。",
+                    },
+                },
+                "required": ["section", "content"],
+            },
+            handler=lambda **kw: (
+                self._profile.set_about_me(kw["content"])
+                if kw["section"] == "about_me"
+                else self._profile.set_projects(kw["content"])
+                if kw["section"] == "projects"
+                else self._profile.set_preferences(kw["content"])
+            ) or f"Updated profile section '{kw['section']}'.",
+        ))
         return registry
 
     def start(self):
@@ -295,10 +329,21 @@ class EventLoop:
             self._config.memory_context_turns
         )
 
-        # Build wake prompt
-        wake_msg = PromptBuilder.build_wake_prompt(reason, perception_text, memory_context)
+        # Check silent streak — provides optional context for the LLM
+        silent_streak = self._memory.get_silent_streak()
+
+        # Build wake prompt with context
+        wake_msg = PromptBuilder.build_wake_prompt(
+            reason,
+            perception_text,
+            memory_context,
+            silent_streak=silent_streak,
+        )
 
         Terminal.info(f"[Wake] {reason}")
+        if silent_streak >= 5:
+            Terminal.info(f"(已连续 {silent_streak} 次沉默，已注入上下文提醒)")
+
         self._agent.history.append({"role": "user", "content": wake_msg})
         self._agent.run_turn(is_proactive=True)
         print()
@@ -319,6 +364,8 @@ class EventLoop:
         print("Chanel Agent — Autonomous Agent Runtime")
         print(f"Platform: Windows | Model: {self._config.model}")
         print(f"DB: {self._config.db_path}")
+        profile_md = self._config.db_path.parent / "user_profile.md"
+        print(f"Profile: {profile_md}")
         print(f"Notifications: {'Enabled' if self._notifier.is_available() else 'Terminal only'}")
         print(f"Callback server: http://localhost:{CALLBACK_PORT}")
         print("=" * 60)

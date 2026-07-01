@@ -263,6 +263,34 @@ class MemoryStore:
 
     # ---- Close ----
 
+    # ---- Silent Streak ----
+
+    def get_silent_streak(self, session_id: str) -> int:
+        """Count consecutive 'silent' cycle entries (not observation-only entries).
+
+        Only considers entries where action is explicitly 'silent' or 'send_message'.
+        Observation-only entries (action='') are skipped — they don't break the streak
+        but also don't count toward it.
+        A 'send_message' entry resets the streak to 0.
+        """
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT action FROM thought_chains
+               WHERE session_id = ? AND action IN ('silent', 'send_message')
+               ORDER BY id DESC LIMIT 50""",
+            (session_id,),
+        ).fetchall()
+
+        streak = 0
+        for row in rows:
+            if row["action"] == "silent":
+                streak += 1
+            else:
+                break  # send_message resets
+        return streak
+
+    # ---- Close ----
+
     def close(self):
         """Close the database connection."""
         if hasattr(self._local, "conn") and self._local.conn is not None:
