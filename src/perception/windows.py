@@ -11,8 +11,8 @@ from .snapshot import PerceptionSnapshot
 class WindowsPerception(AbstractPerception):
     """Windows desktop perception - reads active window, idle time, and fullscreen state."""
 
-    user32: ctypes.WinDLL
-    kernel32: ctypes.WinDLL
+    user32: "ctypes.WinDLL"
+    kernel32: "ctypes.WinDLL"
 
     def __init__(self):
         self.user32 = ctypes.windll.user32
@@ -20,7 +20,8 @@ class WindowsPerception(AbstractPerception):
 
     def is_available(self) -> bool:
         """Check if we're running on Windows."""
-        return ctypes.windll is not None
+        import platform
+        return platform.system() == "Windows"
 
     def get_active_window_info(self) -> tuple[str, str]:
         """Get active window title and application name."""

@@ -75,9 +75,19 @@ class EventLoop:
 
     def _create_perception(self) -> AbstractPerception:
         """Create platform-appropriate perception implementation."""
-        from perception.windows import WindowsPerception
+        import platform
 
-        return WindowsPerception()
+        system = platform.system()
+        if system == "Windows":
+            from perception.windows import WindowsPerception
+
+            return WindowsPerception()
+        elif system == "Darwin":
+            from perception.macos import MacOSPerception
+
+            return MacOSPerception()
+        else:
+            raise RuntimeError(f"Unsupported platform: {system}")
 
     def _build_tools(self) -> ToolRegistry:
         """Build and register all tools."""
@@ -374,7 +384,8 @@ class EventLoop:
             return
         print("=" * 60)
         print("Chanel Agent — Autonomous Agent Runtime")
-        print(f"Platform: Windows | Model: {self._config.model}")
+        import platform
+        print(f"Platform: {platform.system()} | Model: {self._config.model}")
         print(f"DB: {self._config.db_path}")
         profile_md = self._config.db_path.parent / "user_profile.md"
         print(f"Profile: {profile_md}")
