@@ -35,8 +35,9 @@ class EventLoop:
     All events flow through a single queue to the agent core.
     """
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, tui_mode: bool = False):
         self._config = config
+        self._tui_mode = tui_mode
         self._event_queue: queue.Queue = queue.Queue()
         self._running = False
 
@@ -271,13 +272,15 @@ class EventLoop:
     def start(self):
         """Start the main event loop."""
         self._running = True
-        self._print_banner()
+        if not self._tui_mode:
+            self._print_banner()
 
         # Start callback HTTP server for notification button clicks
         self._callback_server.start()
 
-        # Start input reader thread
-        threading.Thread(target=self._input_reader, daemon=True).start()
+        # Start input reader thread (not needed in TUI mode)
+        if not self._tui_mode:
+            threading.Thread(target=self._input_reader, daemon=True).start()
 
         # Initial wake
         self._scheduler.schedule(5, "Initial boot - start observing user")
@@ -298,7 +301,7 @@ class EventLoop:
         """Background thread that reads user input."""
         while self._running:
             try:
-                line = Terminal.prompt(">> ")
+                line = Terminal.prompt("")
             except (EOFError, KeyboardInterrupt):
                 self._event_queue.put(("shutdown", None))
                 return
@@ -310,11 +313,16 @@ class EventLoop:
                 continue
             self._event_queue.put(("user", line))
 
+    def submit_user_input(self, text: str) -> None:
+        """Submit user input from TUI (or external source)."""
+        self._event_queue.put(("user", text))
+
     def _handle_user_input(self, text: str):
         """Handle a user text input event."""
         self._agent.history.append({"role": "user", "content": text})
         self._agent.run_turn(is_proactive=False)
-        print()
+        if not self._tui_mode:
+            print()
 
     def _handle_wake(self, reason: str):
         """Handle an autonomous wake event."""
@@ -346,7 +354,8 @@ class EventLoop:
 
         self._agent.history.append({"role": "user", "content": wake_msg})
         self._agent.run_turn(is_proactive=True)
-        print()
+        if not self._tui_mode:
+            print()
 
     def _shutdown(self):
         """Clean shutdown."""
@@ -356,10 +365,13 @@ class EventLoop:
         self._notifier.stop()
         self._memory.end_session("User terminated session.")
         self._memory_store.close()
-        print("\n[Shutdown] Goodbye.")
+        if not self._tui_mode:
+            print("\n[Shutdown] Goodbye.")
 
     def _print_banner(self):
-        """Print startup banner."""
+        """Print startup banner (terminal mode only)."""
+        if self._tui_mode:
+            return
         print("=" * 60)
         print("Chanel Agent — Autonomous Agent Runtime")
         print(f"Platform: Windows | Model: {self._config.model}")

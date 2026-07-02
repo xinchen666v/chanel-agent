@@ -1,60 +1,96 @@
-"""Terminal output with ANSI color support for Windows."""
+"""Terminal and TUI output management.
 
-import os
+Supports two modes:
+  - Terminal mode: standard print with ANSI colors (original behavior)
+  - TUI mode: routes output to Textual TUI panels (chat / status / tool-log)
+
+Switched via Terminal.use_tui(tui_app) before the event loop starts.
+"""
+
+from __future__ import annotations
+
 import sys
+from datetime import datetime
+
+# Forward reference for the TUI app class (avoid circular import at module level)
+TUI_APP = None
 
 
 class Terminal:
-    """Colored terminal output utilities.
+    """Unified output routing — terminal or TUI depending on mode."""
 
-    Handles Windows console initialization for ANSI escape sequences.
-    """
-
-    _initialized = False
+    _tui_app: TUI_APP = None  # type: ignore
+    _tui_mode = False
 
     @classmethod
-    def _ensure_init(cls):
-        if cls._initialized:
-            return
-        cls._initialized = True
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                kernel32 = ctypes.windll.kernel32
-                handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
-                mode = ctypes.c_uint32()
-                kernel32.GetConsoleMode(handle, ctypes.byref(mode))
-                mode.value |= 0x0004  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
-                kernel32.SetConsoleMode(handle, mode)
-            except Exception:
-                pass
+    def use_tui(cls, app) -> None:
+        """Switch to TUI mode. Call before the event loop starts."""
+        cls._tui_app = app
+        cls._tui_mode = True
 
     @classmethod
-    def info(cls, text: str):
-        """Yellow info message."""
-        cls._ensure_init()
-        print(f"\033[33m{text}\033[0m")
+    def _ts(cls) -> str:
+        """Timestamp prefix for terminal mode. Empty in TUI mode."""
+        if cls._tui_mode:
+            return ""
+        return datetime.now().strftime("[%H:%M:%S] ")
+
+    # ── Info / status messages → status panel (TUI) or yellow print (terminal) ──
 
     @classmethod
-    def agent_message(cls, text: str):
-        """Magenta agent message."""
-        cls._ensure_init()
-        print(f"\n\033[35m[Agent] {text}\033[0m\n")
+    def info(cls, text: str) -> None:
+        """System-level info message."""
+        if cls._tui_mode and cls._tui_app:
+            cls._tui_app.update_status(text)
+        else:
+            print(f"\033[33m{text}\033[0m")
+
+    # ── Agent messages → chat panel (TUI) or magenta print (terminal) ──
 
     @classmethod
-    def tool_debug(cls, text: str):
-        """Gray tool debug output."""
-        cls._ensure_init()
-        print(f"\033[90m> {text}\033[0m")
+    def agent_message(cls, text: str) -> None:
+        """Agent proactive message (from send_message tool)."""
+        if cls._tui_mode and cls._tui_app:
+            cls._tui_app.add_chat("agent", text)
+        else:
+            print(f"\n{cls._ts()}\033[35m[Agent] {text}\033[0m\n")
 
     @classmethod
-    def prompt(cls, text: str = ""):
-        """Cyan user prompt."""
-        cls._ensure_init()
-        return input(f"\033[36m{text}\033[0m")
+    def agent_response(cls, text: str) -> None:
+        """Agent response text (non-proactive, direct reply to user input)."""
+        if cls._tui_mode and cls._tui_app:
+            cls._tui_app.add_chat("agent", text)
+        else:
+            print(text)
+
+    # ── Tool debug output → tool-log panel (TUI) or grey print (terminal) ──
 
     @classmethod
-    def banner(cls, text: str):
-        """Large banner output."""
-        cls._ensure_init()
-        print(f"\033[36m{text}\033[0m")
+    def tool_debug(cls, text: str) -> None:
+        """Tool call debug output."""
+        if cls._tui_mode and cls._tui_app:
+            cls._tui_app.add_tool(text)
+        else:
+            print(f"\033[90m> {text}\033[0m")
+
+    # ── Prompt (terminal only, TUI uses Input widget) ──
+
+    @classmethod
+    def prompt(cls, text: str = "") -> str:
+        """Read user input. In TUI mode returns empty string (input handled by widget)."""
+        if cls._tui_mode:
+            return ""
+        try:
+            return input(f"\033[36m{text}\033[0m")
+        except (EOFError, KeyboardInterrupt):
+            return "q"
+
+    # ── Banner ──
+
+    @classmethod
+    def banner(cls, text: str) -> None:
+        """Banner / startup message. In TUI mode routes to status."""
+        if cls._tui_mode and cls._tui_app:
+            cls._tui_app.update_status(text)
+        else:
+            print(f"\033[36m{text}\033[0m")

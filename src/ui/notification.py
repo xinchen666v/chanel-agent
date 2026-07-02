@@ -73,7 +73,7 @@ class Notifier:
         title = data.get("title", "Chanel Agent")
         message = data.get("message", "")
         quick_replies = data.get("quick_replies", [])
-        timeout_ms = data.get("timeout_ms", 15000)
+        timeout_ms = data.get("timeout_ms", 60000)
 
         root = self._tk_root
         if root is None:
@@ -150,14 +150,28 @@ class Notifier:
         y = 20  # 20px from top
         bubble.geometry(f"{win_width}x{win_height}+{x}+{y}")
 
-        # Auto-dismiss after timeout
+        # Auto-dismiss after timeout (cancelled on mouse hover)
+        close_timer = [None]
+
         def auto_close():
             try:
                 bubble.destroy()
             except Exception:
                 pass
 
-        bubble.after(timeout_ms, auto_close)
+        def schedule_close():
+            if close_timer[0] is not None:
+                bubble.after_cancel(close_timer[0])
+            close_timer[0] = bubble.after(timeout_ms, auto_close)
+
+        def pause_close(_event=None):
+            if close_timer[0] is not None:
+                bubble.after_cancel(close_timer[0])
+                close_timer[0] = None
+
+        schedule_close()
+        bubble.bind("<Enter>", pause_close)
+        bubble.bind("<Leave>", lambda _e: schedule_close())
 
         # Fade-in effect (simple: just show it)
         # On Windows, we can use alpha for fade-in
@@ -172,7 +186,7 @@ class Notifier:
         self,
         title: str,
         message: str,
-        duration: str = "short",
+        duration: str = "long",
         actions: list[dict] | None = None,
     ) -> bool:
         """Send a bubble notification. Non-blocking.
@@ -180,12 +194,14 @@ class Notifier:
         Args:
             title: Notification title.
             message: Notification body text.
-            duration: 'short' (~15s) or 'long' (~30s).
+            duration: 'short' (~30s) or 'long' (~60s). Default is long so
+                      proactive messages don't disappear before the user notices.
             actions: Optional list of {"label": str, "response": str} dicts.
 
         Returns:
             True if notification was queued successfully.
         """
+
         if not self._available:
             return False
 
@@ -193,7 +209,7 @@ class Notifier:
         if actions:
             quick_replies = [a.get("label", a.get("response", "")) for a in actions[:2]]
 
-        timeout_ms = 30000 if duration == "long" else 15000
+        timeout_ms = 60000 if duration == "long" else 30000
 
         self._tk_queue.put({
             "title": title,

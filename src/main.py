@@ -6,9 +6,11 @@ forms a behavioral profile, and proactively decides when to speak
 or stay silent — without waiting for the user to ask first.
 
 Usage:
-    python -m src.main
+    python -m src.main               # TUI mode (default)
+    python -m src.main --terminal    # Terminal mode (plain print, good for log capture)
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -25,15 +27,46 @@ from config import get_config
 from agent.event_loop import EventLoop
 
 
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Chanel Agent — Autonomous Desktop Agent Runtime",
+    )
+    parser.add_argument(
+        "--terminal", "-t",
+        action="store_true",
+        help="Run in terminal mode (plain text output, useful for log capture).",
+    )
+    return parser.parse_args()
+
+
 def main():
-    """Entry point: load config, initialize event loop, start running."""
+    """Entry point: start TUI mode (default) or terminal mode."""
+    args = _parse_args()
     config = get_config()
 
-    loop = EventLoop(config)
+    # Terminal mode: explicit flag or TUI unavailable
+    if args.terminal:
+        loop = EventLoop(config)
+        try:
+            loop.start()
+        except KeyboardInterrupt:
+            print("\n[Shutdown] Interrupted. Goodbye.")
+        return
+
+    # TUI mode (default)
     try:
-        loop.start()
-    except KeyboardInterrupt:
-        print("\n[Shutdown] Interrupted. Goodbye.")
+        from ui.tui_app import AgentTUI
+
+        app = AgentTUI(config)
+        app.run()
+        return
+    except ImportError:
+        # textual not installed — fall back to terminal
+        loop = EventLoop(config)
+        try:
+            loop.start()
+        except KeyboardInterrupt:
+            print("\n[Shutdown] Interrupted. Goodbye.")
 
 
 if __name__ == "__main__":

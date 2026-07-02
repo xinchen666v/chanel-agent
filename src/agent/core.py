@@ -1,5 +1,6 @@
 """Agent core - LLM conversation loop with tool use."""
 
+import sys
 from anthropic import Anthropic
 
 from tools.registry import ToolRegistry
@@ -59,11 +60,13 @@ class AgentCore:
             # Capture reasoning text from the first response (before tool_use)
             if is_proactive and not inference:
                 inference = self._extract_text(response.content)
+                if inference:
+                    Terminal.info(f"[推理] {inference[:200].replace(chr(10), ' ')}")
 
             if response.stop_reason != "tool_use":
                 text = self._extract_text(response.content).strip()
                 if text and not is_proactive:
-                    print(text)
+                    Terminal.agent_response(text)
                 # Record action based on actual tool use during this turn,
                 # not on the final text-only response (which lacks tool_use blocks)
                 if is_proactive:
