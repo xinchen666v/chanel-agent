@@ -7,8 +7,9 @@ from ui.notification import Notifier
 class MessageTool:
     """Tool wrapper for sending proactive messages to the user.
 
-    Sends to both terminal (for inline visibility) and Windows toast
-    notification (for desktop-level alerting with optional quick replies).
+    Sends to both terminal (for inline visibility) and platform notification
+    (Windows toast / macOS Notification Center / Linux bubble) with optional
+    quick replies routed via the callback server.
     """
 
     def __init__(self, notifier: Notifier):
@@ -20,8 +21,8 @@ class MessageTool:
         Args:
             content: The message body.
             quick_replies: Optional list of 1-2 short reply strings. When provided,
-                           the toast notification includes clickable buttons that
-                           route the reply back to the agent via the callback server.
+                           the notification includes quick-reply options that route
+                           the reply back to the agent via the callback server.
         """
         Terminal.agent_message(content)
         self._notifier.send_bubble(content, quick_replies=quick_replies)
