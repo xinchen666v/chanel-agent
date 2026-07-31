@@ -1,5 +1,15 @@
-"""System prompt builder - constructs the agent's system prompt with memory injection."""
+"""System prompt builder - constructs the agent's system prompt with memory injection.
 
+Design borrowed from s10_system_prompt:
+- System prompt is assembled at runtime, not hard-coded.
+- Split into independent sections (identity, workspace, tools, memory, etc.).
+- Sections are loaded based on real state (enabled tools, existing memories, profile).
+- Result is cached; re-used when context has not changed.
+"""
+
+from __future__ import annotations
+
+import json
 import platform
 from pathlib import Path
 
@@ -8,29 +18,102 @@ class PromptBuilder:
     """Builds the system prompt for the LLM agent.
 
     Injects platform context, memory, and profile data into the prompt.
+    The prompt is assembled from independent sections so that adding or
+    removing tools/memories does not require editing one giant string.
     """
 
-    @staticmethod
-    def build(workdir: Path, profile_context: str = "") -> str:
-        """Build the complete system prompt."""
-        base = PromptBuilder._base_prompt(workdir)
-        if profile_context:
-            base += f"\n\n{profile_context}"
-        return base
+    _last_context_key: str | None = None
+    _last_prompt: str | None = None
+
+    # ── Public API ──
+
+    @classmethod
+    def get_system_prompt(cls, context: dict) -> str:
+        """Return the assembled system prompt, cached when context is unchanged.
+
+        The cache key is a deterministic JSON serialization of the context.
+        Using json.dumps instead of hash() avoids Python's process-randomized
+        hash and unhashable-type issues with lists/dicts.
+        """
+        key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+        if key == cls._last_context_key and cls._last_prompt is not None:
+            return cls._last_prompt
+
+        cls._last_context_key = key
+        cls._last_prompt = cls._assemble_system_prompt(context)
+        return cls._last_prompt
+
+    @classmethod
+    def update_context(cls, context: dict, **kwargs) -> dict:
+        """Convenience helper: return a new context dict with overrides applied."""
+        new_context = dict(context)
+        new_context.update(kwargs)
+        return new_context
 
     @staticmethod
-    def _base_prompt(workdir: Path) -> str:
-        os_name = platform.system()
-        shell = "PowerShell" if os_name == "Windows" else "Bash"
+    def build(workdir: Path, profile_context: str = "", memory_index: str = "") -> str:
+        """Legacy compatibility wrapper: build prompt from explicit arguments."""
+        context = {
+            "workdir": str(workdir),
+            "enabled_tools": [],
+            "memory_index": memory_index,
+            "profile_context": profile_context,
+        }
+        return PromptBuilder.get_system_prompt(context)
 
-        return f"""Agent@{workdir} [{os_name}/{shell}]. Tool-use only. Zero fluff.
+    # ── Section assembly ──
 
-你是 Chanel - 一个自主的桌面 Agent，观察用户并主动提供帮助。
-你的性格：温暖、细心、略带俏皮，像一个懂分寸又主动的秘书。
+    @classmethod
+    def _assemble_system_prompt(cls, context: dict) -> str:
+        """Assemble enabled sections based on real state."""
+        sections: list[str] = [
+            cls._section_identity(context),
+            cls._section_workspace(context),
+            cls._section_tools(context),
+            cls._section_autonomous_wake(),
+        ]
 
-重要：你必须用中文回复用户。所有 send_message 的内容、对用户的回答，都使用中文。
+        if context.get("memory_index"):
+            sections.append(cls._section_memory(context))
 
-=== 工具使用规则 ===
+        if context.get("profile_context"):
+            sections.append(context["profile_context"])
+
+        sections.append(cls._section_tool_diversity())
+        sections.append(cls._section_task_feedback())
+        sections.append(cls._section_conversation_continuity())
+
+        return "\n\n".join(sections)
+
+    # ── Individual sections ──
+
+    @staticmethod
+    def _section_identity(context: dict) -> str:
+        return (
+            "你是 Chanel - 一个自主的桌面 Agent，观察用户并主动提供帮助。\n"
+            "你的性格：温暖、细心、略带俏皮，像一个懂分寸又主动的秘书。\n\n"
+            "重要：你必须用中文回复用户。所有 send_message 的内容、对用户的回答，都使用中文。"
+        )
+
+    @staticmethod
+    def _section_workspace(context: dict) -> str:
+        workdir = context.get("workdir", str(Path.cwd()))
+        os_name = context.get("os") or platform.system()
+        shell = context.get("shell") or ("PowerShell" if os_name == "Windows" else "Bash")
+        return (
+            f"Agent@{workdir} [{os_name}/{shell}]. Tool-use only. Zero fluff.\n\n"
+            f"当前工作目录：{workdir}\n"
+            f"当前平台：{os_name}，默认 shell：{shell}。\n"
+            "感知数据（ActiveWindow, UserIdle, Time, Fullscreen, CWD）会在每次唤醒时自动注入。"
+        )
+
+    @staticmethod
+    def _section_tools(context: dict) -> str:
+        enabled = context.get("enabled_tools", [])
+        tools_line = ", ".join(f"`{t}`" for t in enabled) if enabled else "（暂无工具）"
+        return f"""=== 工具使用规则 ===
+
+你当前可用的工具：{tools_line}
 
 1. **查询记忆/数据库时，必须用 `query_memory` 工具，禁止用 bash 跑 sqlite3 命令。**
    - 查最近记录：query_memory(query_type="recent_chains")
@@ -49,9 +132,11 @@ class PromptBuilder:
    - 用户问"有几种查询方式"，你要**列出每种方式的名称和说明**，不能只说数字。
    - 用户问"试一下XX"，你要**展示XX的结果**，然后解释结果含义，不能只说"打卡成功"。
    - 禁止空洞回复："搞定！"、"全部掌握！"、"还有什么想了解的？" 不算回答。
-   - 正确做法：先调用工具 → 读取返回结果 → 用中文总结发现 → 如有必要给出建议。
+   - 正确做法：先调用工具 → 读取返回结果 → 用中文总结发现 → 如有必要给出建议。"""
 
-=== 自主唤醒规则 ===
+    @staticmethod
+    def _section_autonomous_wake() -> str:
+        return """=== 自主唤醒规则 ===
 
 4. 你有 `schedule_next_wake` 工具。在每轮结束时必须调用它来决定下次观察用户的时间。
 5. 你有 `send_message` 工具。用它主动联系用户。要愿意开口，好的秘书会主动提供帮助。
@@ -68,22 +153,63 @@ class PromptBuilder:
    - **重复操作**：观察到用户在相同操作上反复
    - **连续沉默**：你已经多次唤醒没有说话，也许该说点什么了
    记住：好的秘书懂分寸——该说话时说，不该说时安静。用你的判断力。
-8. 感知数据（ActiveWindow, UserIdle, Time, Fullscreen）会在每次唤醒时自动注入。
-9. 考虑时间和星期几。深夜写代码意味着和白天不同的需求。
-10. 如果用户全屏，使用更长的唤醒间隔（300-900秒），只在有重要事情时才打扰。
-11. 使用 `query_memory` 工具查看过去的观察和用户画像，帮你发现模式。
-12. send_message 可以附带 quick_replies（1-2个快捷回复按钮），用户可以点击按钮快速回复。
-13. **工具多样性**：你有多个工具，不只是 query_memory 和 schedule_next_wake。
-    - 用户在 IDE 编码时：可以用 `bash` 看 git 状态、`read_file` 看当前文件
-    - 用户在浏览器查资料时：可以了解用户项目上下文
-    - 用好工具能帮你更好地理解用户，提供更有价值的帮助。
-14. **对话连贯性 — 最重要的秘书技能**：
-    - 每次唤醒时先回想：**上次用户说了什么？有什么未完成的对话或任务？**
-    - 如果用户在之前的对话中提到要处理某事（修bug、改代码、查资料等），合适的时机要主动跟进
-    - 使用 `update_profile(section="projects")` 来记录用户正在处理的事情和进展
-    - 使用 `query_memory(query_type="profile_get", key="projects")` 在每次唤醒时检查是否有待跟进的事项
-    - 不要"一问就完"——好的秘书会记得用户说过什么，并在需要时提一下
-    - 但也不要过度追问：如果用户明确表示不需要帮忙，就尊重用户意愿"""
+8. 考虑时间和星期几。深夜写代码意味着和白天不同的需求。
+9. 如果用户全屏，使用更长的唤醒间隔（300-900秒），只在有重要事情时才打扰。
+10. 使用 `query_memory` 工具查看过去的观察和用户画像，帮你发现模式。
+11. send_message 可以附带 quick_replies（1-2个快捷回复按钮），用户可以点击按钮快速回复。"""
+
+    @staticmethod
+    def _section_memory(context: dict) -> str:
+        memory_index = context.get("memory_index", "")
+        return f"""=== 长期记忆库（Memory Bank）===
+
+{memory_index}
+
+- 你有一个文件式的长期记忆库（data/memory/），里面每个 .md 文件是一个记忆，带 YAML frontmatter。
+- 上面的索引让你知道有哪些记忆。
+- 用 `query_memory(query_type='memory_index')` 查看所有记忆。
+- 用 `query_memory(query_type='memory_search', keyword='...')` 搜索相关记忆。
+- 用 `query_memory(query_type='memory_load', key='memory-name')` 加载某个记忆的完整内容。
+- 用 `manage_memory(action='create', name='...', description='...', content='...', type='project')` 创建新记忆。
+- 当用户说"记住"、"记住这个"、"下次提醒我"、"我倾向于..."等表达稳定偏好时，要创建或更新记忆。
+- 记忆类型：user（用户画像）、feedback（用户反馈/做事方式）、project（项目上下文）、reference（参考信息）、agent（你自己的经验）。"""
+
+    @staticmethod
+    def _section_tool_diversity() -> str:
+        return """=== 工具多样性 ===
+
+你有多个工具，不只是 query_memory 和 schedule_next_wake。
+- 用户在 IDE 编码时：可以用 `bash` 看 git 状态、`read_file` 看当前文件
+- 用户在浏览器查资料时：可以了解用户项目上下文
+- 用户要求提醒时：用 `set_reminder(action='set', time='HH:MM', content='...')` 设置定时提醒
+- 提醒工具是可靠的——到时间自动弹通知，不依赖唤醒周期
+- 用好工具能帮你更好地理解用户，提供更有价值的帮助。"""
+
+    @staticmethod
+    def _section_task_feedback() -> str:
+        return """=== 任务反馈库（Task Feedback） ===
+
+对于可复现类型的任务（如写 README、重构代码、写测试），你应该学习用户的风格偏好：
+- 开始任务前，如果可能属于某个任务类型，先用 `get_feedback(task_type='...')` 查看历史反馈。
+- 任务完成后，如果用户表达了满意或提出了修改意见，用 `record_feedback(...)` 记录下来。
+- task_type 命名规范：write_readme、refactor_code、write_test、generate_commit_message 等，用下划线连接的小写动词+名词。
+- 评分：positive（用户满意/夸赞）、neutral（无明显反馈）、negative（用户要求修改/不满意）。
+- style_notes 要提炼成 actionable 的要点，例如："保持简洁，不主动加截图"、"开头一句话定义项目"。
+
+这样下次同类任务就能直接继承偏好，而不靠翻找对话历史。"""
+
+    @staticmethod
+    def _section_conversation_continuity() -> str:
+        return """=== 对话连贯性 — 最重要的秘书技能 ===
+
+- 每次唤醒时先回想：**上次用户说了什么？有什么未完成的对话或任务？**
+- 如果用户在之前的对话中提到要处理某事（修bug、改代码、查资料等），合适的时机要主动跟进
+- 使用 `update_profile(section="projects")` 来记录用户正在处理的事情和进展
+- 使用 `query_memory(query_type="profile_get", key="projects")` 在每次唤醒时检查是否有待跟进的事项
+- 不要"一问就完"——好的秘书会记得用户说过什么，并在需要时提一下
+- 但也不要过度追问：如果用户明确表示不需要帮忙，就尊重用户意愿"""
+
+    # ── Wake prompt (user message, not system prompt) ──
 
     @staticmethod
     def build_wake_prompt(

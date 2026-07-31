@@ -18,6 +18,7 @@ class PerceptionSnapshot:
     hour_of_day: int
     day_of_week: int  # 0=Monday, 6=Sunday
     is_weekend: bool
+    cwd: str = ""  # Current working directory of the agent process
 
     def to_json(self) -> str:
         """Serialize to JSON for persistent storage."""
@@ -31,6 +32,7 @@ class PerceptionSnapshot:
             "hour_of_day": self.hour_of_day,
             "day_of_week": self.day_of_week,
             "is_weekend": self.is_weekend,
+            "cwd": self.cwd,
         })
 
     @classmethod
@@ -47,6 +49,7 @@ class PerceptionSnapshot:
             hour_of_day=obj["hour_of_day"],
             day_of_week=obj["day_of_week"],
             is_weekend=obj["is_weekend"],
+            cwd=obj.get("cwd", ""),
         )
 
     def to_text_prompt(self) -> str:
@@ -59,6 +62,7 @@ class PerceptionSnapshot:
             f"  Fullscreen:   {'Yes' if self.is_fullscreen else 'No'}",
             f"  Time:         {self.hour_of_day}:00",
             f"  Weekend:      {'Yes' if self.is_weekend else 'No'}",
+            f"  CWD:          {self.cwd or '(unknown)'}",
             f"  OS:           {self.os}",
         ]
         return "\n".join(lines)

@@ -1,28 +1,37 @@
-"""User behavior profile - persisted as a markdown file.
+"""User behavior profile - persisted as a special memory file.
 
-Replaces the old SQLite key-value approach with a human-readable markdown file
-that the LLM can also update via the update_profile tool.
+This file is managed by MemoryBank as `data/memory/user_profile.md`.
+It contains both:
+  - Auto-tracked behavioral data (app usage, active hours)
+  - Semantic sections updated by the LLM (about me, projects, preferences)
 
-Auto-tracked sections (app usage, active hours) are updated from perception data.
-Semantic sections (about me, projects, preferences) are updated by the LLM.
+The frontmatter makes it a first-class citizen of the memory bank index.
 """
 
+from __future__ import annotations
+
+import re
 from pathlib import Path
 from datetime import datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .bank import MemoryBank
 
 
 class UserProfile:
     """Builds and maintains a persistent user behavior profile.
 
-    Stores data in data/user_profile.md:
-      - App Usage: auto-tracked from perception snapshots
-      - Active Hours: auto-tracked from perception snapshots
-      - About Me / Projects / Preferences: updated by LLM via tool
+    The profile lives at data/memory/user_profile.md and is indexed by MEMORY.md.
+    It keeps backward-compatible APIs (set_about_me, set_projects, set_preferences)
+    while integrating with the file-based memory bank.
     """
 
-    def __init__(self, md_path: Path):
-        self._md_path = md_path
-        # In-memory data
+    FILENAME = "user_profile"
+
+    def __init__(self, memory_bank: MemoryBank):
+        self._bank = memory_bank
+        # In-memory data for fast access
         self._apps: dict[str, int] = {}
         self._hours: dict[int, int] = {}
         self._about_me = ""
@@ -33,35 +42,48 @@ class UserProfile:
     # ── File I/O ──
 
     def _load(self):
-        """Load profile from markdown file. Creates default if not exists."""
-        if self._md_path.exists():
-            self._parse(self._md_path.read_text(encoding="utf-8"))
-        else:
+        """Load profile from the memory bank file. Creates default if not exists."""
+        existing = self._bank.load(self.FILENAME)
+        if existing.startswith("Error:"):
             self._save()
+            return
+        self._parse(existing)
 
     def _parse(self, content: str):
-        """Parse markdown sections into in-memory data."""
+        """Parse the markdown body into in-memory data."""
+        # Remove frontmatter
+        body = content
+        if body.startswith("---"):
+            parts = body.split("---", 2)
+            if len(parts) >= 3:
+                body = parts[2]
+
         current_section = None
-        for line in content.split("\n"):
+        section_lines: dict[str, list[str]] = {
+            "about": [],
+            "projects": [],
+            "preferences": [],
+        }
+
+        for line in body.split("\n"):
             stripped = line.strip()
 
             if stripped.startswith("## App Usage"):
                 current_section = "apps"
+                continue
             elif stripped.startswith("## Active Hours"):
                 current_section = "hours"
+                continue
             elif stripped.startswith("## About Me"):
                 current_section = "about"
+                continue
             elif stripped.startswith("## Current Projects"):
                 current_section = "projects"
+                continue
             elif stripped.startswith("## Preferences"):
                 current_section = "preferences"
-            elif stripped.startswith("_Last updated"):
                 continue
-
-            # Skip table headers and separators
-            if current_section in ("apps", "hours") and (
-                stripped.startswith("|") and ("Application" in stripped or "Hour" in stripped or "---" in stripped)
-            ):
+            elif stripped.startswith("_Last updated"):
                 continue
 
             if current_section == "apps" and stripped.startswith("|"):
@@ -78,17 +100,16 @@ class UserProfile:
                     except ValueError:
                         pass
 
-            elif current_section == "about" and stripped and not stripped.startswith("*No info"):
-                self._about_me = stripped
+            elif current_section in section_lines:
+                if stripped and not stripped.startswith("*No info"):
+                    section_lines[current_section].append(line)
 
-            elif current_section == "projects" and stripped and not stripped.startswith("*No info"):
-                self._projects = stripped
-
-            elif current_section == "preferences" and stripped and not stripped.startswith("*No info"):
-                self._preferences = stripped
+        self._about_me = "\n".join(section_lines["about"]).strip()
+        self._projects = "\n".join(section_lines["projects"]).strip()
+        self._preferences = "\n".join(section_lines["preferences"]).strip()
 
     def _save(self):
-        """Write in-memory data to markdown file."""
+        """Write in-memory data to the memory bank file."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         apps_rows = "\n".join(
@@ -102,8 +123,7 @@ class UserProfile:
         ) if self._hours else "| _(no data yet)_ | - |"
 
         content = (
-            "# User Profile\n"
-            f"\n_Last updated: {now}_\n"
+            f"_Last updated: {now}_\n"
             "\n## App Usage\n"
             "| Application | Times Observed |\n"
             "|------------|:--------------:|\n"
@@ -119,8 +139,19 @@ class UserProfile:
             "\n## Preferences\n"
             f"{self._preferences or '*No info yet*'}\n"
         )
-        self._md_path.parent.mkdir(parents=True, exist_ok=True)
-        self._md_path.write_text(content, encoding="utf-8")
+
+        # Use memory bank create/update to keep index in sync
+        existing = self._bank.load(self.FILENAME)
+        if existing.startswith("Error:"):
+            self._bank.create(
+                name=self.FILENAME,
+                description="Aggregated user behavior profile and semantic notes",
+                content=content,
+                type="user",
+                tags=["auto-tracked", "profile"],
+            )
+        else:
+            self._bank.update(self.FILENAME, content, mode="replace")
 
     # ── Auto-tracking from perception data ──
 
@@ -193,4 +224,4 @@ class UserProfile:
     def summarize(self) -> str:
         """Build the full profile as markdown for LLM prompt injection."""
         self._save()  # Ensure file is up to date
-        return f"[User Profile]\n{self._md_path.read_text(encoding='utf-8')}"
+        return f"[User Profile]\n{self._bank.load(self.FILENAME)}"

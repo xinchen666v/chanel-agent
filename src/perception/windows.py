@@ -3,6 +3,7 @@
 import ctypes
 from ctypes import wintypes
 from datetime import datetime
+import os
 
 from .base import AbstractPerception
 from .snapshot import PerceptionSnapshot
@@ -164,4 +165,5 @@ class WindowsPerception(AbstractPerception):
             hour_of_day=now.hour,
             day_of_week=weekday,
             is_weekend=weekday >= 5,
+            cwd=os.getcwd(),
         )

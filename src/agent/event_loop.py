@@ -1,7 +1,9 @@
 """Event-driven main loop - orchestrates user input and autonomous wake events."""
 
+import platform
 import queue
 import threading
+from pathlib import Path
 
 from anthropic import Anthropic
 
@@ -14,9 +16,16 @@ from tools.shell import Shell
 from tools.wake import WakeTool
 from tools.message import MessageTool
 from tools.memory_query import MemoryQueryTool
+from tools.memory_manage import MemoryManageTool
+from tools.permissions import PermissionGate
+from tools.reminder import ReminderTool
+from tools.feedback import FeedbackTool
+from agent.hooks import HookRegistry
 from memory.store import MemoryStore
 from memory.chain import ThoughtChain
 from memory.profile import UserProfile
+from memory.bank import MemoryBank
+from memory.feedback import FeedbackBank
 from agent.core import AgentCore
 from agent.prompt import PromptBuilder
 from ui.terminal import Terminal
@@ -47,12 +56,22 @@ class EventLoop:
         self._notifier = Notifier(event_queue=self._event_queue, callback_port=CALLBACK_PORT)
         self._callback_server = ReplyHTTPServer(CALLBACK_PORT, self._event_queue)
         self._memory_store = MemoryStore(config.db_path)
-        profile_md_path = config.db_path.parent / "user_profile.md"
-        self._profile = UserProfile(profile_md_path)
+
+        # File-based memory bank (s09_memory inspired)
+        self._memory_bank = MemoryBank(config.db_path.parent / "memory")
+        self._migrate_old_profile(config.db_path.parent)
+        self._profile = UserProfile(self._memory_bank)
         self._memory = ThoughtChain(self._memory_store, self._profile)
 
+        # Task-level feedback bank
+        self._feedback_bank = FeedbackBank(config.db_path.parent / "feedback")
+
         # Initialize tools
+        self._reminder_tool = ReminderTool(self._event_queue, self._notifier)
         self._tools = self._build_tools()
+
+        # Hook registry: agent behavior extensions without modifying the loop.
+        self._hook_registry = self._build_hook_registry(config.workdir)
 
         # Initialize Anthropic client
         self._client = Anthropic(
@@ -60,9 +79,17 @@ class EventLoop:
             api_key=config.api_key,
         )
 
-        # Build system prompt with profile
-        profile_context = self._memory.get_profile_context()
-        self._system_prompt = PromptBuilder.build(config.workdir, profile_context)
+        # Build system prompt at runtime from independent sections.
+        # Context reflects real state: enabled tools, workspace, memories, profile.
+        system_context = {
+            "workdir": str(config.workdir),
+            "os": platform.system(),
+            "shell": "PowerShell" if platform.system() == "Windows" else "Bash",
+            "enabled_tools": self._tools.get_tool_names(),
+            "memory_index": self._memory_bank.list_index(),
+            "profile_context": self._memory.get_profile_context(),
+        }
+        self._system_prompt = PromptBuilder.get_system_prompt(system_context)
 
         # Initialize agent core
         self._agent = AgentCore(
@@ -71,6 +98,7 @@ class EventLoop:
             system_prompt=self._system_prompt,
             tools=self._tools,
             memory=self._memory,
+            hook_registry=self._hook_registry,
         )
 
     def _create_perception(self) -> AbstractPerception:
@@ -89,6 +117,23 @@ class EventLoop:
         else:
             raise RuntimeError(f"Unsupported platform: {system}")
 
+    def _migrate_old_profile(self, data_dir: Path):
+        """Migrate old data/user_profile.md to the memory bank if needed."""
+        old_path = data_dir / "user_profile.md"
+        new_path = data_dir / "memory" / "user_profile.md"
+        if old_path.exists() and not new_path.exists():
+            try:
+                self._memory_bank.create(
+                    name="user_profile",
+                    description="Aggregated user behavior profile and semantic notes (migrated)",
+                    content=old_path.read_text(encoding="utf-8"),
+                    type="user",
+                    tags=["auto-tracked", "profile", "migrated"],
+                )
+                print(f"[Migration] Moved old profile to {new_path}")
+            except Exception as e:
+                print(f"[Migration] Failed to migrate old profile: {e}")
+
     def _build_tools(self) -> ToolRegistry:
         """Build and register all tools."""
         registry = ToolRegistry()
@@ -96,7 +141,13 @@ class EventLoop:
         shell = Shell(self._config.workdir)
         wake_tool = WakeTool(self._scheduler)
         message_tool = MessageTool(self._notifier)
-        memory_query_tool = MemoryQueryTool(self._memory_store, profile=self._profile)
+        memory_query_tool = MemoryQueryTool(
+            self._memory_store,
+            profile=self._profile,
+            memory_bank=self._memory_bank,
+        )
+        memory_manage_tool = MemoryManageTool(self._memory_bank)
+        feedback_tool = FeedbackTool(self._feedback_bank)
 
         registry.register(Tool(
             name="bash",
@@ -151,7 +202,7 @@ class EventLoop:
         registry.register(Tool(
             name="query_memory",
             description=(
-                "查询 Agent 自己的记忆库（SQLite）。这是查询记忆的唯一正确方式，禁止用 bash 跑 sqlite3 命令。"
+                "查询 Agent 自己的记忆。这是查询记忆的唯一正确方式，禁止用 bash 跑 sqlite3 命令。"
                 "query_type 选项：\n"
                 "  - recent_chains: 最近的思维链条（含窗口标题、应用名、空闲时间等观察详情）\n"
                 "  - search_observations: 按关键词搜索观察记录（如 keyword='Trae' 查找所有包含 Trae 的记录）\n"
@@ -159,22 +210,25 @@ class EventLoop:
                 "  - session_stats: 当前会话统计\n"
                 "  - profile_get: 查用户画像section。key='about_me'|'projects'|'preferences'\n"
                 "  - profile_all: 查完整用户画像（markdown格式，含自动追踪数据和LLM写入的语义信息）\n"
-                "  - chain_detail: 查指定思维链条详情（需传 key 参数为 chain_id）"
+                "  - chain_detail: 查指定思维链条详情（需传 key 参数为 chain_id）\n"
+                "  - memory_index: 查看长期记忆库索引（MEMORY.md）\n"
+                "  - memory_search: 按关键词搜索长期记忆文件（keyword='...'）\n"
+                "  - memory_load: 加载指定记忆的完整内容（key='memory-name'）"
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "query_type": {
                         "type": "string",
-                        "description": "查询类型: recent_chains, search_observations, timeline, session_stats, profile_get, profile_all, chain_detail",
+                        "description": "查询类型: recent_chains, search_observations, timeline, session_stats, profile_get, profile_all, chain_detail, memory_index, memory_search, memory_load",
                     },
                     "key": {
                         "type": "string",
-                        "description": "profile_get 时传 section 名(about_me/projects/preferences)；chain_detail 时传 chain_id。",
+                        "description": "profile_get 时传 section 名(about_me/projects/preferences)；chain_detail 时传 chain_id；memory_load 时传记忆名。",
                     },
                     "keyword": {
                         "type": "string",
-                        "description": "search_observations 时传搜索关键词（如 'Trae', 'VSCode', 'Chrome'）。",
+                        "description": "search_observations / memory_search 时传搜索关键词（如 'Trae', 'VSCode', 'Chrome'）。",
                     },
                     "limit": {
                         "type": "integer",
@@ -188,6 +242,64 @@ class EventLoop:
                 kw.get("key", ""),
                 kw.get("keyword", ""),
                 kw.get("limit", 10),
+            ),
+        ))
+        registry.register(Tool(
+            name="manage_memory",
+            description=(
+                "管理长期记忆库（data/memory/）。当用户说'记住'、表达稳定偏好、或需要记录项目/参考信息时使用。"
+                "action 选项：\n"
+                "  - create: 创建新记忆。需传 name, description, content, type（user/feedback/project/reference/agent）\n"
+                "  - update: 更新已有记忆。需传 name, content, mode='replace'|'append'\n"
+                "  - delete: 删除记忆。需传 name\n"
+                "  - load: 查看记忆内容。需传 name"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "update", "delete", "load"],
+                        "description": "操作类型",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "记忆名称（用作文件名）。例如 'project-chanel-agent', 'user-preference-tabs'。",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "简短描述，会显示在 MEMORY.md 索引中。",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "记忆正文（markdown）。",
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["user", "feedback", "project", "reference", "agent"],
+                        "description": "记忆类型。user=用户画像, feedback=用户反馈/做事方式, project=项目上下文, reference=参考信息, agent=Agent经验。",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "可选标签列表。",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["replace", "append"],
+                        "description": "update 时生效：replace=替换, append=追加。",
+                    },
+                },
+                "required": ["action"],
+            },
+            handler=lambda **kw: memory_manage_tool.handle(
+                kw["action"],
+                kw.get("name", ""),
+                kw.get("description", ""),
+                kw.get("content", ""),
+                kw.get("type", "reference"),
+                kw.get("tags"),
+                kw.get("mode", "replace"),
             ),
         ))
         registry.register(Tool(
@@ -245,6 +357,50 @@ class EventLoop:
             ),
         ))
         registry.register(Tool(
+            name="set_reminder",
+            description=(
+                "设置定时提醒，到时间后自动弹出通知。不依赖唤醒周期，精确到分钟。"
+                "action 选项：\n"
+                "  - set: 创建新提醒。需传 time='YYYY-MM-DD HH:MM' 或 'HH:MM'（今天），content='提醒内容'\n"
+                "  - list: 查看所有待处理的提醒\n"
+                "  - cancel: 取消指定提醒。需传 reminder_id"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["set", "list", "cancel"],
+                        "description": "操作类型：set=创建提醒, list=查看所有提醒, cancel=取消提醒",
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "提醒时间。格式：'YYYY-MM-DD HH:MM'（如 '2026-07-16 09:00'）或 'HH:MM'（今天，如 '17:30'）。仅 set 时需要。",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "提醒内容。仅 set 时需要。",
+                    },
+                    "repeat": {
+                        "type": "boolean",
+                        "description": "是否重复提醒（暂不支持，可忽略）。",
+                    },
+                    "reminder_id": {
+                        "type": "string",
+                        "description": "要取消的提醒 ID。仅 cancel 时需要。",
+                    },
+                },
+                "required": ["action"],
+            },
+            handler=lambda **kw: self._reminder_tool.handle(
+                kw["action"],
+                kw.get("time", ""),
+                kw.get("content", ""),
+                kw.get("repeat", False),
+                kw.get("reminder_id", ""),
+            ),
+        ))
+        registry.register(Tool(
             name="update_profile",
             description=(
                 "更新你对用户的了解。当你通过对话了解到用户的新信息时，用此工具记录到用户画像中。"
@@ -277,6 +433,107 @@ class EventLoop:
                 else self._profile.set_preferences(kw["content"])
             ) or f"Updated profile section '{kw['section']}'.",
         ))
+        registry.register(Tool(
+            name="record_feedback",
+            description=(
+                "记录用户对某个任务产出的反馈。同类任务下次执行前可用 get_feedback 查看历史偏好。\n"
+                "task_type 示例：write_readme、refactor_code、write_test。\n"
+                "rating 只能是 positive / neutral / negative。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_type": {
+                        "type": "string",
+                        "description": "任务类型，例如 'write_readme'。",
+                    },
+                    "artifact": {
+                        "type": "string",
+                        "description": "产物路径或名称，例如 'README.md'。",
+                    },
+                    "request_summary": {
+                        "type": "string",
+                        "description": "用户原始需求的一句话摘要。",
+                    },
+                    "feedback": {
+                        "type": "string",
+                        "description": "用户的实际反馈内容。",
+                    },
+                    "rating": {
+                        "type": "string",
+                        "enum": ["positive", "neutral", "negative"],
+                        "description": "反馈倾向。",
+                    },
+                    "style_notes": {
+                        "type": "string",
+                        "description": "从反馈中提取出的、下次执行同类任务时应遵循的风格要点。",
+                    },
+                },
+                "required": ["task_type", "artifact", "request_summary", "feedback"],
+            },
+            handler=lambda **kw: feedback_tool.handle_record(
+                kw["task_type"],
+                kw["artifact"],
+                kw["request_summary"],
+                kw["feedback"],
+                kw.get("rating", "neutral"),
+                kw.get("style_notes", ""),
+            ),
+        ))
+        registry.register(Tool(
+            name="get_feedback",
+            description=(
+                "在开始同类任务前，查看该任务类型的历史反馈，以继承用户的风格偏好。\n"
+                "例如：写 README 前先 get_feedback(task_type='write_readme')。"
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_type": {
+                        "type": "string",
+                        "description": "任务类型，例如 'write_readme'。",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回最近几条反馈（默认 3）。",
+                    },
+                },
+                "required": ["task_type"],
+            },
+            handler=lambda **kw: feedback_tool.handle_get(
+                kw["task_type"],
+                kw.get("top_k", 3),
+            ),
+        ))
+        return registry
+
+    def _build_hook_registry(self, workdir: Path) -> HookRegistry:
+        """Register default hooks (permissions, logging, etc.)."""
+        registry = HookRegistry()
+
+        # PreToolUse: permission gate (from s03, now external to the loop)
+        permission_gate = PermissionGate(
+            workdir,
+            prompt_func=Terminal.prompt,
+        )
+        registry.register("PreToolUse", permission_gate.pre_tool_use_hook)
+
+        # PreToolUse: debug log
+        def _log_pre_tool_use(block):
+            Terminal.tool_debug(f"[HOOK] PreToolUse: {block.name}")
+            return None
+
+        registry.register("PreToolUse", _log_pre_tool_use)
+
+        # PostToolUse: large-output warning
+        def _warn_large_output(block, output):
+            out_str = str(output)
+            if len(out_str) > 50000:
+                Terminal.info(f"[HOOK] Large output from {block.name}: {len(out_str)} chars")
+            return None
+
+        registry.register("PostToolUse", _warn_large_output)
+
         return registry
 
     def start(self):
@@ -306,6 +563,8 @@ class EventLoop:
                 self._handle_user_input(data)
             elif etype == "wake":
                 self._handle_wake(data)
+            elif etype == "reminder":
+                self._handle_reminder(data)
 
     def _input_reader(self):
         """Background thread that reads user input."""
@@ -367,12 +626,34 @@ class EventLoop:
         if not self._tui_mode:
             print()
 
+    def _handle_reminder(self, data: dict):
+        """Handle a reminder that has fired.
+
+        The notification was already sent by the Reminder itself.
+        Here we inject the reminder into the agent's conversation so it
+        knows the reminder went off and can follow up if needed.
+        """
+        content = data.get("content", "")
+        Terminal.info(f"[Reminder Fired] {content}")
+
+        # Inject as a system message so the agent is aware
+        reminder_msg = (
+            f"[SYSTEM REMINDER FIRED] 你的提醒到期了：{content}\n"
+            "用户已经收到了通知弹窗。你可以 send_message 跟进一下，"
+            "或者直接 schedule_next_wake 继续观察。"
+        )
+        self._agent.history.append({"role": "user", "content": reminder_msg})
+        self._agent.run_turn(is_proactive=True)
+        if not self._tui_mode:
+            print()
+
     def _shutdown(self):
         """Clean shutdown."""
         self._running = False
         self._scheduler.cancel()
         self._callback_server.stop()
         self._notifier.stop()
+        self._reminder_tool.cancel_all()
         self._memory.end_session("User terminated session.")
         self._memory_store.close()
         if not self._tui_mode:
@@ -387,8 +668,8 @@ class EventLoop:
         import platform
         print(f"Platform: {platform.system()} | Model: {self._config.model}")
         print(f"DB: {self._config.db_path}")
-        profile_md = self._config.db_path.parent / "user_profile.md"
-        print(f"Profile: {profile_md}")
+        memory_dir = self._config.db_path.parent / "memory"
+        print(f"Memory Bank: {memory_dir}")
         print(f"Notifications: {'Enabled' if self._notifier.is_available() else 'Terminal only'}")
         print(f"Callback server: http://localhost:{CALLBACK_PORT}")
         print("=" * 60)

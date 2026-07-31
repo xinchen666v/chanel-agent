@@ -81,7 +81,9 @@ class Terminal:
         if cls._tui_mode:
             return ""
         try:
-            return input(f"\033[36m{text}\033[0m")
+            # Use the input() prompt itself (not a separate print) so the
+            # marker is guaranteed to appear immediately before the cursor.
+            return input(f"\033[36m> {text}\033[0m")
         except (EOFError, KeyboardInterrupt):
             return "q"
 

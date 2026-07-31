@@ -4,6 +4,7 @@ import sys
 from anthropic import Anthropic
 
 from tools.registry import ToolRegistry
+from agent.hooks import HookRegistry
 from memory.chain import ThoughtChain
 from agent.prompt import PromptBuilder
 from ui.terminal import Terminal
@@ -22,12 +23,14 @@ class AgentCore:
         system_prompt: str,
         tools: ToolRegistry,
         memory: ThoughtChain,
+        hook_registry: HookRegistry | None = None,
     ):
         self._client = client
         self._model = model
         self._system = system_prompt
         self._tools = tools
         self._memory = memory
+        self._hooks = hook_registry
         self._history: list = []
 
     @property
@@ -48,6 +51,10 @@ class AgentCore:
         inference = ""
 
         while True:
+            # Optional input-side hooks (logging, context injection, etc.)
+            if self._hooks is not None:
+                self._hooks.trigger("UserPromptSubmit", self._history)
+
             response = self._client.messages.create(
                 model=self._model,
                 system=self._system,
@@ -64,6 +71,13 @@ class AgentCore:
                     Terminal.info(f"[推理] {inference[:200].replace(chr(10), ' ')}")
 
             if response.stop_reason != "tool_use":
+                # Stop hooks can force the loop to continue instead of exiting.
+                if self._hooks is not None:
+                    force = self._hooks.trigger("Stop", self._history)
+                    if force:
+                        self._history.append({"role": "user", "content": force})
+                        continue
+
                 text = self._extract_text(response.content).strip()
                 if text and not is_proactive:
                     Terminal.agent_response(text)
@@ -84,7 +98,8 @@ class AgentCore:
                     if block.name == "send_message":
                         spoke = True
                         spoken_content = block.input.get("content", "")
-                    output = self._tools.dispatch(block.name, **block.input)
+
+                    output = self._run_tool_with_hooks(block)
                     Terminal.tool_debug(f"{block.name}: {str(output)[:200]}")
                     results.append({
                         "type": "tool_result",
@@ -93,6 +108,24 @@ class AgentCore:
                     })
 
             self._history.append({"role": "user", "content": results})
+
+    def _run_tool_with_hooks(self, block) -> str:
+        """Trigger PreToolUse hooks, dispatch if allowed, then PostToolUse hooks.
+
+        If a PreToolUse hook returns a non-None value, that value is used as
+        the tool result and the tool is not executed.
+        """
+        if self._hooks is not None:
+            blocked = self._hooks.trigger("PreToolUse", block)
+            if blocked is not None:
+                return str(blocked)
+
+        output = self._tools.dispatch(block.name, **block.input)
+
+        if self._hooks is not None:
+            self._hooks.trigger("PostToolUse", block, output)
+
+        return output
 
     def clear_history(self):
         """Clear conversation history."""

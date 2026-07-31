@@ -2,6 +2,7 @@
 
 import ctypes
 import ctypes.util
+import os
 import platform
 import re
 import subprocess
@@ -115,4 +116,5 @@ class MacOSPerception(AbstractPerception):
             hour_of_day=now.hour,
             day_of_week=weekday,
             is_weekend=weekday >= 5,
+            cwd=os.getcwd(),
         )

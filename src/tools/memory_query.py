@@ -1,4 +1,4 @@
-"""Memory query tool - allows the LLM to inspect its own thought chains and user profile.
+"""Memory query tool - allows the LLM to inspect its own thought chains, user profile, and long-term memory bank.
 
 Query types:
   - recent_chains: Recent thought chains WITH observation details (window, app, idle, time)
@@ -8,11 +8,19 @@ Query types:
   - profile_get: Get a specific user profile section (key="about_me"|"projects"|"preferences")
   - profile_all: Get full user profile (markdown format)
   - chain_detail: Get full detail of a specific thought chain
+  - memory_index: List all long-term memories (from MEMORY.md index)
+  - memory_search: Search long-term memories by keyword
+  - memory_load: Load full content of a specific memory file (key=memory_name)
 """
 
 import json
+from typing import TYPE_CHECKING
+
 from memory.store import MemoryStore
 from memory.profile import UserProfile
+
+if TYPE_CHECKING:
+    from memory.bank import MemoryBank
 
 
 class MemoryQueryTool:
@@ -22,11 +30,23 @@ class MemoryQueryTool:
     to query the database directly - always use this tool.
     """
 
-    def __init__(self, store: MemoryStore, profile: UserProfile | None = None):
+    def __init__(
+        self,
+        store: MemoryStore,
+        profile: UserProfile | None = None,
+        memory_bank: "MemoryBank | None" = None,
+    ):
         self._store = store
         self._profile = profile
+        self._memory_bank = memory_bank
 
-    def handle(self, query_type: str, key: str = "", keyword: str = "", limit: int = 10) -> str:
+    def handle(
+        self,
+        query_type: str,
+        key: str = "",
+        keyword: str = "",
+        limit: int = 10,
+    ) -> str:
         """Query agent memory.
 
         Args:
@@ -36,10 +56,13 @@ class MemoryQueryTool:
                 - 'timeline': Readable timeline of recent observations
                 - 'session_stats': Current session statistics
                 - 'profile_get': Get a specific profile section. key='about_me'|'projects'|'preferences'
-                - 'profile_all': Get full user profile (markdown with auto-tracked data and LLM-written sections)
+                - 'profile_all': Get full user profile
                 - 'chain_detail': Get full chain by chain_id (requires 'key')
-            key: Profile key (for profile_get) or chain_id (for chain_detail).
-            keyword: Search keyword (for search_observations).
+                - 'memory_index': List all long-term memories (MEMORY.md)
+                - 'memory_search': Search long-term memories by keyword (pass 'keyword')
+                - 'memory_load': Load full content of a memory file (pass 'key' as memory name)
+            key: Profile key / chain_id / memory name depending on query_type.
+            keyword: Search keyword.
             limit: Max rows to return.
         """
         try:
@@ -69,6 +92,19 @@ class MemoryQueryTool:
                 if not key:
                     return "Error: 'key' (chain_id) is required for chain_detail."
                 return self._chain_detail(key)
+
+            elif query_type == "memory_index":
+                return self._memory_index()
+
+            elif query_type == "memory_search":
+                if not keyword:
+                    return "Error: 'keyword' is required for memory_search. Example: keyword='Trae'"
+                return self._memory_search(keyword, limit)
+
+            elif query_type == "memory_load":
+                if not key:
+                    return "Error: 'key' (memory name) is required for memory_load."
+                return self._memory_load(key)
 
             else:
                 return self._help()
@@ -195,6 +231,24 @@ class MemoryQueryTool:
         lines.append(f"  outcome: {detail['outcome']}")
         return "\n".join(lines)
 
+    def _memory_index(self) -> str:
+        """Return the MEMORY.md index."""
+        if self._memory_bank is None:
+            return "Memory bank not available."
+        return self._memory_bank.list_index()
+
+    def _memory_search(self, keyword: str, limit: int) -> str:
+        """Search long-term memory files by keyword."""
+        if self._memory_bank is None:
+            return "Memory bank not available."
+        return self._memory_bank.search(keyword, limit=limit)
+
+    def _memory_load(self, name: str) -> str:
+        """Load full content of a memory file."""
+        if self._memory_bank is None:
+            return "Memory bank not available."
+        return self._memory_bank.load(name)
+
     def _help(self) -> str:
         return (
             "Unknown query_type. Valid options:\n"
@@ -204,5 +258,8 @@ class MemoryQueryTool:
             "  - session_stats: Current session statistics\n"
             "  - profile_get: Get profile section. key='about_me'|'projects'|'preferences'\n"
             "  - profile_all: Get full profile (markdown)\n"
-            "  - chain_detail: Get full chain detail (pass 'key' param)"
+            "  - chain_detail: Get full chain detail (pass 'key' param)\n"
+            "  - memory_index: List all long-term memories\n"
+            "  - memory_search: Search long-term memories by keyword\n"
+            "  - memory_load: Load a memory file by name (pass 'key' param)"
         )

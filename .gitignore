@@ -7,3 +7,5 @@ log.txt
 log0702.txt
 svg/
 data/
+__pycache__/
+*.pyc

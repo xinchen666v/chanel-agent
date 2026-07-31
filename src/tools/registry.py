@@ -39,15 +39,15 @@ class ToolRegistry:
             for t in self._tools.values()
         ]
 
-    def dispatch(self, name: str, **kwargs) -> str:
+    def dispatch(self, tool_name: str, **kwargs) -> str:
         """Dispatch a tool call to the appropriate handler."""
-        tool = self._tools.get(name)
+        tool = self._tools.get(tool_name)
         if tool is None:
-            return f"Unknown tool: {name}"
+            return f"Unknown tool: {tool_name}"
         try:
             return tool.handler(**kwargs)
         except Exception as e:
-            return f"Tool error ({name}): {e}"
+            return f"Tool error ({tool_name}): {e}"
 
     def get_tool_names(self) -> list[str]:
         """Return all registered tool names."""
