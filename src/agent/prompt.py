@@ -70,6 +70,7 @@ class PromptBuilder:
             cls._section_identity(context),
             cls._section_workspace(context),
             cls._section_tools(context),
+            cls._section_task_planning(),
             cls._section_autonomous_wake(),
         ]
 
@@ -133,6 +134,24 @@ class PromptBuilder:
    - 用户问"试一下XX"，你要**展示XX的结果**，然后解释结果含义，不能只说"打卡成功"。
    - 禁止空洞回复："搞定！"、"全部掌握！"、"还有什么想了解的？" 不算回答。
    - 正确做法：先调用工具 → 读取返回结果 → 用中文总结发现 → 如有必要给出建议。"""
+
+    @staticmethod
+    def _section_task_planning() -> str:
+        return """=== 任务规划规则 ===
+
+你有 `todo_write` 工具，用于在动手之前理清思路。它不能做任何实际工作——不能读文件、不能跑命令、不能修改任何东西。它的唯一作用就是帮你**规划**。
+
+12. **复杂任务要先计划**：当用户的请求包含 3 个以上独立步骤时，第一步必须调用 todo_write 列出所有步骤（全部 pending）。
+13. **一次只做一个**：开始一个步骤时，用 merge=true 将其标记为 in_progress。完成后立即标记为 completed。永远不要同时有两个 in_progress。
+14. **做完再说**：不要提前标记完成。真正做完一个步骤后，再更新状态。
+15. **merge 模式**：更新单个任务状态时传 merge=true，只传需要变更的任务项，不要每次都传整个列表。
+16. **简单任务不需要 todo**：一句话就能完成的事（"查一下最近记录"、"发个消息"）不用列 TODO。
+17. 示例流程：
+    用户："重构 auth 模块，加类型标注，然后跑测试"
+    第一步：todo_write(todos=[{"id":"1","content":"重构 auth 模块","status":"pending"},{"id":"2","content":"添加类型标注","status":"pending"},{"id":"3","content":"运行测试","status":"pending"}], merge=false)
+    第二步：开始做 auth 重构 → todo_write(todos=[{"id":"1","status":"in_progress"}], merge=true)
+    第三步：重构完成 → todo_write(todos=[{"id":"1","status":"completed","content":"重构 auth 模块：提取了验证逻辑到独立函数"}], merge=true)
+    第四步：开始加类型标注 → 以此类推"""
 
     @staticmethod
     def _section_autonomous_wake() -> str:

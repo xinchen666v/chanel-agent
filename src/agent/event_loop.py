@@ -20,6 +20,7 @@ from tools.memory_manage import MemoryManageTool
 from tools.permissions import PermissionGate
 from tools.reminder import ReminderTool
 from tools.feedback import FeedbackTool
+from tools.todo import TodoTool
 from agent.hooks import HookRegistry
 from memory.store import MemoryStore
 from memory.chain import ThoughtChain
@@ -67,6 +68,7 @@ class EventLoop:
         self._feedback_bank = FeedbackBank(config.db_path.parent / "feedback")
 
         # Initialize tools
+        self._todo_tool = TodoTool()
         self._reminder_tool = ReminderTool(self._event_queue, self._notifier)
         self._tools = self._build_tools()
 
@@ -505,6 +507,64 @@ class EventLoop:
                 kw.get("top_k", 3),
             ),
         ))
+        registry.register(Tool(
+            name="todo_write",
+            description=(
+                "Create and manage a task list for your current coding session. "
+                "This tool does NOT perform any actual work — it only helps you "
+                "plan and track progress. Use it BEFORE starting complex tasks "
+                "(3+ distinct steps).\n\n"
+                "Rules:\n"
+                "- Only ONE task in_progress at a time.\n"
+                "- Mark tasks completed IMMEDIATELY after finishing.\n"
+                "- Use merge=true to update individual task statuses without "
+                "re-sending the entire list.\n"
+                "- Include a brief summary when marking tasks as completed."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "The task list. Each item must have content, status, and id.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Unique identifier for this task (e.g. '1', '2', '3'). Required for merge mode.",
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The task description.",
+                                },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "Current status of the task.",
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["high", "medium", "low"],
+                                    "description": "Task priority (optional).",
+                                },
+                            },
+                            "required": ["content", "status", "id"],
+                        },
+                    },
+                    "merge": {
+                        "type": "boolean",
+                        "description": "Whether to merge the todos with the existing list. If true, only matching ids are updated; new items are appended. If false, the entire list is replaced.",
+                    },
+                },
+                "required": ["todos", "merge"],
+            },
+            handler=lambda **kw: (
+                self._todo_tool.handle_merge(kw["todos"])
+                if kw.get("merge")
+                else self._todo_tool.handle(kw["todos"])
+            ),
+        ))
         return registry
 
     def _build_hook_registry(self, workdir: Path) -> HookRegistry:
@@ -589,7 +649,9 @@ class EventLoop:
     def _handle_user_input(self, text: str):
         """Handle a user text input event."""
         self._agent.history.append({"role": "user", "content": text})
+        self._maybe_inject_todo_reminder()
         self._agent.run_turn(is_proactive=False)
+        self._todo_tool.increment_rounds()
         if not self._tui_mode:
             print()
 
@@ -622,7 +684,9 @@ class EventLoop:
             Terminal.info(f"(已连续 {silent_streak} 次沉默，已注入上下文提醒)")
 
         self._agent.history.append({"role": "user", "content": wake_msg})
+        self._maybe_inject_todo_reminder()
         self._agent.run_turn(is_proactive=True)
+        self._todo_tool.increment_rounds()
         if not self._tui_mode:
             print()
 
@@ -643,9 +707,28 @@ class EventLoop:
             "或者直接 schedule_next_wake 继续观察。"
         )
         self._agent.history.append({"role": "user", "content": reminder_msg})
+        self._maybe_inject_todo_reminder()
         self._agent.run_turn(is_proactive=True)
+        self._todo_tool.increment_rounds()
         if not self._tui_mode:
             print()
+
+    def _maybe_inject_todo_reminder(self):
+        """Inject a todo reminder if the agent hasn't used todo_write for 3+ turns.
+
+        Design ported from learn-claude-code/s05_todo_write:
+        After 3 consecutive turns without a todo_write call, a reminder message
+        is injected into the conversation history before the next LLM call.
+        The counter is reset when the reminder is injected, and also when the
+        agent calls todo_write during a turn.
+        """
+        if self._todo_tool.rounds_since_todo >= 3:
+            self._agent.history.append({
+                "role": "user",
+                "content": self._todo_tool.get_reminder_message(),
+            })
+            self._todo_tool.reset_rounds()
+            Terminal.info("[Todo] Nag reminder injected (3+ rounds without todo_write)")
 
     def _shutdown(self):
         """Clean shutdown."""
