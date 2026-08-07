@@ -54,6 +54,17 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_watch_records_created
         ON watch_records(created_at DESC)
     """)
+    # Migration: 清理重复 bvid，每个 bvid 只保留最新一条记录
+    conn.execute("""
+        DELETE FROM watch_records WHERE id NOT IN (
+            SELECT MAX(id) FROM watch_records WHERE bvid != '' GROUP BY bvid
+        )
+    """)
+    # 加唯一索引，后续 UPSERT 用 ON CONFLICT
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_watch_records_bvid ON watch_records(bvid)")
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -148,13 +159,30 @@ def _tid_to_category(tid: int, tid_v2: int = 0) -> str:
 
 
 def _fetch_category(bvid: str) -> tuple[str, str]:
-    """Call B站 API to get video category and clean title.
+    """Get video category and clean title.
+
+    Priority: DB cache → B站 API.
+    Avoids redundant API calls for the same bvid.
 
     Returns:
         (category, clean_title) — both default to empty string on failure.
     """
     if not bvid:
         return "", ""
+
+    # 1. 查 DB 缓存（已有该 bvid 的分类信息则直接复用）
+    conn = sqlite3.connect(str(DB_PATH))
+    try:
+        row = conn.execute(
+            "SELECT category, title FROM watch_records WHERE bvid = ?",
+            (bvid,),
+        ).fetchone()
+        if row and row[0] and row[0] != "未知":
+            return row[0], row[1] or ""
+    finally:
+        conn.close()
+
+    # 2. 缓存未命中，调 B站 API
     try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -229,12 +257,17 @@ async def update(request: Request):
 
     # Normalize timestamp: use local time (ignore JS's UTC timestamp)
     ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    # Persist
+    # Persist: UPSERT — 同一 bvid 只存一条记录，持续更新进度
     conn = sqlite3.connect(str(DB_PATH))
     try:
         conn.execute(
             """INSERT INTO watch_records (bvid, title, category, progress, current_time, duration, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(bvid) DO UPDATE SET
+                   progress     = excluded.progress,
+                   current_time = excluded.current_time,
+                   duration     = excluded.duration,
+                   created_at   = excluded.created_at""",
             (bvid, title, category, progress, current_time, duration, ts),
         )
         conn.commit()
@@ -272,24 +305,17 @@ async def get_latest(minutes: int = 5):
 
 @app.get("/progress")
 async def get_progress():
-    """Return all unique series/videos with their latest progress.
+    """Return all watched videos with their latest progress.
 
-    For each unique bvid, returns the most recent record.
-    Useful for "what's my current追番进度" queries.
+    Each bvid has exactly one record (UPSERT), so just return all rows.
     """
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
-            """SELECT r1.*
-               FROM watch_records r1
-               INNER JOIN (
-                   SELECT bvid, MAX(created_at) AS max_ts
-                   FROM watch_records
-                   GROUP BY bvid
-               ) r2 ON r1.bvid = r2.bvid AND r1.created_at = r2.max_ts
-               WHERE r1.bvid != ''
-               ORDER BY r1.created_at DESC""",
+            """SELECT * FROM watch_records
+               WHERE bvid != ''
+               ORDER BY created_at DESC""",
         ).fetchall()
     finally:
         conn.close()

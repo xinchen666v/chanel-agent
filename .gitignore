@@ -8,4 +8,5 @@ log0702.txt
 svg/
 data/
 __pycache__/
+bili-helper/_deps/
 *.pyc
